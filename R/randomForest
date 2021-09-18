@@ -1,0 +1,143 @@
+library(randomForest)
+library(ggplot2)
+
+options(stringsAsFactors = T)
+path = "C:\\Users\\Admin\\Desktop\\"
+
+# Preprocessing ASV -------------------------------------------------------
+
+df <- readxl::read_xlsx(paste0(path, "greengenes.xlsx"), 
+                        col_names = TRUE)
+temp <- as.data.frame(df)
+rownames(temp) <- temp$...1
+temp <- t(temp[-1])
+colnames(temp) <- gsub(" ", "_", colnames(temp))
+ASV_df <- as.data.frame(temp)
+
+
+ASV_df$V2 <- rownames(ASV_df)
+
+design <- read.delim(paste0(path, "design.tsv"), sep = "\t", header = FALSE)
+data <- merge(design, ASV_df, by = 'V2')[-1]
+
+# Run the random forest model ---------------------------------------------
+
+## choosing 80% of data to train randomForest
+# set.seed(13)
+idx <- sample(nrow(data), nrow(data)*1)
+
+train_df <- data[idx,]
+test_df <- data[-idx,]
+
+ASV_forest <- randomForest(V1 ~ ., data = train_df, proximity=TRUE, importance = TRUE)
+
+ASV_forest
+## error rate of each tree
+plot(ASV_forest)
+
+## Find the optimal mtry value,
+# mtryStart: The starting number of predictor variables to consider at each split.
+
+mtry <- tuneRF(train_df[,-1],  # remove predictor variable
+               train_df[,1],    # define response variable
+               ntreeTry=500,
+               stepFactor=0.1, 
+               improve=0.01, 
+               trace=TRUE, 
+               plot=TRUE)
+
+
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1]
+print(mtry)
+print(best.m)
+
+## Build model again using best mtry value
+ASV_forest <- randomForest(V1 ~ ., data = train_df, proximity = TRUE, 
+                           mtry = best.m, importance = TRUE,ntree = 500)
+
+ASV_forest
+# Testing -----------------------------------------------------------------
+## Margins plot
+margin_df <- randomForest::margin(ASV_forest)
+plot(margin_df)
+ggplot() +  geom_point(aes(x = c(1:length(margin_df)), 
+                           y = sort(margin_df), 
+                           color = names(sort(margin_df))))
+
+## out-of-bag estimateof error rate
+ASV_forest
+
+## actually, test_df is not essential for randomForest, but will return a human-friendly data
+ASV_pred_res = predict(ASV_forest, test_df, type="response")  
+table(observed=test_df$V1, predicted=ASV_pred_res)
+
+?randomForest
+## ROC
+# build the logistic regression model and test it
+library(pROC)
+iris
+
+ASV_pred = predict(ASV_forest, test_df, type = "prob")
+ROC_rf <- pROC::roc(test_df$V1, ASV_pred[,2], percent = TRUE)
+ROC_rf_auc <- pROC::auc(ROC_rf)
+
+plot_data <- as.data.frame(cbind(test_df$V1, ASV_pred))
+colnames(plot_data) <- c("type", "F", "HF")
+# code: https://web.expasy.org/pROC/screenshots.html
+
+result.coords <- coords(ROC_rf , "best", 
+                        best.method="closest.topleft", 
+                        ret=c("threshold", "accuracy"))
+
+
+# print the performance of each model
+results <- pROC::coords(ROC_rf, seq(0, 1, by = 0.01),
+                        input=c("threshold"),
+                        ret=c("sensitivity","specificity","ppv","npv"))
+
+
+
+paste("Accuracy % of random forest: ", mean(test_df$V1 == round(ASV_pred[,2])))
+paste("Area under curve of random forest: ", ROC_rf_auc)
+
+ggplot(data = results) + geom_line(aes(x = specificity, y = sensitivity))
+
+# importance --------------------------------------------------------------
+## we want a larger MeanDecreaseAccuracy or MeanDecreaseGini
+ASV_importance <- round(importance(ASV_forest), 3)
+sorted_importance <- ASV_importance[order(ASV_importance[,3], decreasing = TRUE), ]
+
+# feature selection -----------------------------------------------------------
+set.seed(13)
+## Cross-Valdidation 
+train_rfcv <- replicate(5, rfcv(train_df[-1], train_df$V1, 
+                                  cv.fold = 10, step = 1.5), simplify = FALSE)
+?rfcv
+temp <- data.frame(sapply(train_rfcv, '[[', 'error.cv'))
+temp$num <- rownames(temp)
+
+rfcv_df <- tidyr::pivot_longer(temp, col= -num, names_to = "rep", values_to = "value")
+
+rfcv_df$num <- as.numeric(as.character(rfcv_df$num))
+
+rfcv_df.mean <- aggregate(rfcv_df$value, by = list(rfcv_df$num), FUN = mean)
+
+# Mean Decrease Accuracy - How much the model accuracy decreases if we drop that variable.
+# Mean Decrease Gini - Measure of variable importance based on the Gini impurity index used for the calculation of splits in trees.
+# lesser is better!!!
+library(ggplot2)
+# total plot
+ggplot(rfcv_df,  aes(num, value)) +  
+  geom_line(aes(color = rep)) +
+  geom_vline(xintercept = min(rfcv_df.mean$x))+
+  ylab(label = "Cross-validation error") + 
+  xlab(label = "Number of variables")+
+ theme_bw()
+
+# mean plot
+ggplot(rfcv_df.mean,  aes(Group.1, x)) +  
+  geom_line(color = "red") +
+  geom_vline(xintercept = min(rfcv_df.mean$x))+
+  ylab(label = "Cross-validation error") + 
+  xlab(label = "Number of variables") +
+  theme_bw()
